@@ -1,0 +1,7 @@
+*.dcu
+/bin/
+/bin64/
+/Win32/
+/Win64/
+/__history
+/__recovery/
