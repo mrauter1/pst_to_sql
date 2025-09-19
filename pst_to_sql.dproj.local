@@ -1,20 +1,21 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <BorlandProject>
 	<Transactions>
-    <Transaction>2025/08/26 17:50:57.000.059,C:\Users\marce\OneDrive\Documents\Embarcadero\Studio\Projects\Project1.dproj=D:\Sistemas\pst_to_sql.new\pst_to_sql.dproj</Transaction>
+    <Transaction>2025/08/26 17:50:57.000.059,D:\Sistemas\pst_to_sql.new\pst_to_sql.dproj=C:\Users\marce\OneDrive\Documents\Embarcadero\Studio\Projects\Project1.dproj</Transaction>
     <Transaction>2025/08/26 17:51:34.000.754,=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
-    <Transaction>2025/08/26 17:51:41.000.582,D:\Sistemas\pst_to_sql.new\Unit1.pas=D:\Sistemas\pst_to_sql.new\mail.data.pas</Transaction>
+    <Transaction>2025/08/26 17:51:41.000.582,D:\Sistemas\pst_to_sql.new\mail.data.pas=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
     <Transaction>2025/08/26 17:51:54.000.937,=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
-    <Transaction>2025/08/26 17:52:56.000.967,D:\Sistemas\pst_to_sql.new\Unit1.pas=D:\Sistemas\pst_to_sql.new\mail.TypesUtils.pas</Transaction>
+    <Transaction>2025/08/26 17:52:56.000.967,D:\Sistemas\pst_to_sql.new\mail.TypesUtils.pas=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
     <Transaction>2025/08/26 17:53:02.000.736,=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
-    <Transaction>2025/08/26 17:53:53.000.137,D:\Sistemas\pst_to_sql.new\Unit1.pas=D:\Sistemas\pst_to_sql.new\mail.Core.pas</Transaction>
+    <Transaction>2025/08/26 17:53:53.000.137,D:\Sistemas\pst_to_sql.new\mail.Core.pas=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
     <Transaction>2025/08/28 10:35:29.000.816,=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
-    <Transaction>2025/08/28 10:35:37.000.429,D:\Sistemas\pst_to_sql.new\mail.ComWorker.pas=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
+    <Transaction>2025/08/28 10:35:37.000.429,D:\Sistemas\pst_to_sql.new\Unit1.pas=D:\Sistemas\pst_to_sql.new\mail.ComWorker.pas</Transaction>
     <Transaction>2025/08/29 15:16:20.000.150,=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
-    <Transaction>2025/08/29 15:16:36.000.736,D:\Sistemas\pst_to_sql.new\Unit1.pas=D:\Sistemas\pst_to_sql.new\mail.FullSync.pas</Transaction>
+    <Transaction>2025/08/29 15:16:36.000.736,D:\Sistemas\pst_to_sql.new\mail.FullSync.pas=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
     <Transaction>2025/09/01 18:27:58.000.750,=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
-    <Transaction>2025/09/01 18:29:23.000.712,D:\Sistemas\pst_to_sql.new\Unit1.pas=D:\Sistemas\pst_to_sql.new\mail.Debug.pas</Transaction>
+    <Transaction>2025/09/01 18:29:23.000.712,D:\Sistemas\pst_to_sql.new\mail.Debug.pas=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
     <Transaction>2025/09/05 14:52:37.000.433,=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
-    <Transaction>2025/09/05 14:53:57.000.484,D:\Sistemas\pst_to_sql.new\Unit1.pas=D:\Sistemas\pst_to_sql.new\mail.Logger.pas</Transaction>
+    <Transaction>2025/09/05 14:53:57.000.484,D:\Sistemas\pst_to_sql.new\mail.Logger.pas=D:\Sistemas\pst_to_sql.new\Unit1.pas</Transaction>
+    <Transaction>2025/09/19 15:23:59.864,=D:\Sistemas\pst_to_sql\mail.OutlookEvents.pas</Transaction>
   </Transactions>
 </BorlandProject>

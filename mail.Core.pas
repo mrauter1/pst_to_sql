@@ -8,7 +8,7 @@ uses
   System.IOUtils, System.Generics.Collections, System.Generics.Defaults,
   Winapi.Windows, System.Win.ComObj, System.Types,
   FireDAC.Stan.Error, Data.DB, mail.Logger,
-  Mail.Data;
+  Mail.Data, mail.OutlookEvents;
 
 { Public facade:
   Creates logger/DB/Outlook components, runs traversal + optional enrichment,
@@ -77,6 +77,14 @@ type
 
     procedure PrintMessageInfo(const Item: OleVariant);
     procedure ClearPSTValues;
+    function EnsureFolderPath(const OutlookPath: string; out FolderId: Integer;
+      out FolderPath: string): Boolean;
+    function EnsureFolderFromVariant(const Folder: OleVariant; out FolderId: Integer;
+      out FolderPath: string): Boolean;
+    function EnsureFolderByEntryId(const FolderEntryId, StoreId: string; out FolderId: Integer;
+      out FolderPath: string; out Folder: OleVariant): Boolean;
+    procedure UpsertSingleMessage(const EntryId, StoreId, SourceFolderId: string);
+    procedure HandleMoveEvent(const Event: TOutlookItemEvent);
   public
     constructor Create(ADb: TDb; AOlk: TOutlookCOM; ALogger: TLogger; const Opts: TCliOptions);
 
@@ -84,6 +92,8 @@ type
 
     function LoadPst: Integer;
     procedure UnloadPST;
+
+    procedure ProcessEvents(const Events: TArray<TOutlookItemEvent>);
 
     property TargetStore: OleVariant read FTargetStore;
     property RootFolder: OleVariant read FRootFolder;
@@ -513,6 +523,253 @@ begin
   FRootDisplay:= Unassigned;
   FPreAttachedPST:= False;
   FPstId:= 0;
+end;
+
+function TIngestor.EnsureFolderPath(const OutlookPath: string; out FolderId: Integer;
+  out FolderPath: string): Boolean;
+var
+  Segments: TArray<string>;
+  segment, tSegment: string;
+  ParentIdVar: Variant;
+  CurrPath, CleanPath: string;
+  Depth: Integer;
+begin
+  FolderId := 0;
+  FolderPath := '';
+  Result := False;
+  CleanPath := Trim(OutlookPath);
+  if CleanPath = '' then
+    Exit(False);
+
+  if CleanPath.StartsWith('\\') then
+    Delete(CleanPath, 1, 2);
+
+  Segments := CleanPath.Split(['\']);
+  ParentIdVar := Null;
+  CurrPath := '';
+  Depth := 0;
+
+  for tSegment in Segments do
+  begin
+    Segment := Trim(tSegment);
+    if Segment = '' then
+      Continue;
+
+    if CurrPath <> '' then
+      CurrPath := CurrPath + '/' + Segment
+    else
+      CurrPath := Segment;
+
+    FolderId := FDb.EnsureFolderRow(FPstId, ParentIdVar, Segment, CurrPath, Depth);
+    ParentIdVar := FolderId;
+    Inc(Depth);
+  end;
+
+  FolderPath := CurrPath;
+  Result := FolderId <> 0;
+end;
+
+function TIngestor.EnsureFolderFromVariant(const Folder: OleVariant; out FolderId: Integer;
+  out FolderPath: string): Boolean;
+var
+  OutlookPath: string;
+begin
+  FolderId := 0;
+  FolderPath := '';
+  Result := False;
+  if not IsVariantAssigned(Folder) then
+    Exit(False);
+
+  OutlookPath := TryGetFolderPath(Folder);
+  if OutlookPath = '' then
+    OutlookPath := VarToStrDefSafe(Folder.Name, '');
+
+  Result := EnsureFolderPath(OutlookPath, FolderId, FolderPath);
+end;
+
+function TIngestor.EnsureFolderByEntryId(const FolderEntryId, StoreId: string;
+  out FolderId: Integer; out FolderPath: string; out Folder: OleVariant): Boolean;
+begin
+  FolderId := 0;
+  FolderPath := '';
+  Folder := Unassigned;
+  Result := False;
+  if FolderEntryId = '' then
+    Exit(False);
+
+  try
+    if StoreId <> '' then
+      Folder := FOlk.Session.GetFolderFromID(FolderEntryId, StoreId)
+    else
+      Folder := FOlk.Session.GetFolderFromID(FolderEntryId);
+  except
+    Folder := Unassigned;
+  end;
+
+  if not IsVariantAssigned(Folder) then
+    Exit(False);
+
+  Result := EnsureFolderFromVariant(Folder, FolderId, FolderPath);
+end;
+
+procedure TIngestor.UpsertSingleMessage(const EntryId, StoreId, SourceFolderId: string);
+var
+  Item, Folder: OleVariant;
+  InternetMessageId, OutlookEntryId, Subject, SenderName, SenderEmail: string;
+  DisplayTo, DisplayCc, Headers, BodyText, BodyHtml, MsgClass: string;
+  SentUtc, RecvUtc, CreateUtc, LastModNew: TDateTime;
+  SearchKeyRead: TBytes;
+  RecRows: TArray<TArray<Variant>>;
+  AttachRows: TArray<TAttachmentRow>;
+  FolderId: Integer;
+  FolderFullPath: string;
+  MessageId: Integer;
+  SizeVariant: Variant;
+begin
+  if EntryId = '' then
+    Exit;
+
+  Item := Unassigned;
+  try
+    if StoreId <> '' then
+      Item := FOlk.Session.GetItemFromID(EntryId, StoreId)
+    else
+      Item := FOlk.Session.GetItemFromID(EntryId);
+  except
+    on E: Exception do
+    begin
+      if Assigned(FLogger) then
+        FLogger.Warn(Format('UpsertSingleMessage: Failed to get item with EntryId %s (StoreId: %s). Error: %s', [EntryId, StoreId, E.Message]));
+      Item := Unassigned;
+    end;
+  end;
+  if not IsVariantAssigned(Item) then
+    Exit;
+
+  FolderId := 0;
+  FolderFullPath := '';
+  try
+    Folder := Item.Parent;
+  except
+    Folder := Unassigned;
+  end;
+
+  if not EnsureFolderFromVariant(Folder, FolderId, FolderFullPath) and (SourceFolderId <> '') then
+    EnsureFolderByEntryId(SourceFolderId, StoreId, FolderId, FolderFullPath, Folder);
+
+  if FolderId = 0 then
+  begin
+    if Assigned(FLogger) then
+      FLogger.Warn(Format('Unable to resolve folder for entry %s', [EntryId]));
+    Exit;
+  end;
+
+  ReadMessageCore(Item,
+    InternetMessageId, OutlookEntryId, Subject, SenderName, SenderEmail,
+    DisplayTo, DisplayCc, Headers, BodyText, BodyHtml, MsgClass,
+    SentUtc, RecvUtc, CreateUtc, LastModNew, SearchKeyRead);
+
+  if OutlookEntryId = '' then
+    OutlookEntryId := EntryId;
+
+  try
+    GetRecipients(Item, Headers, RecRows);
+  except
+    SetLength(RecRows, 0);
+  end;
+
+  try
+    GetAttachments(Item, AttachRows);
+  except
+    SetLength(AttachRows, 0);
+  end;
+
+  SizeVariant := Null;
+  try
+    SizeVariant := Item.Size;
+  except
+    SizeVariant := Null;
+  end;
+
+  MessageId := FDb.MessageExistsByEntryId(FPstId, OutlookEntryId);
+  if MessageId = 0 then
+  begin
+    MessageId := FDb.InsertMessageReturnId(
+      FPstId, FolderId,
+      InternetMessageId, OutlookEntryId, Subject, SenderName, SenderEmail,
+      DisplayTo, DisplayCc,
+      SentUtc, RecvUtc, CreateUtc,
+      Headers, BodyText, BodyHtml,
+      SizeVariant, LastModNew, SearchKeyRead);
+
+    if Length(AttachRows) > 0 then
+      SaveAttachments(MessageId, AttachRows);
+  end
+  else
+  begin
+    FDb.UpdateMessageCoreFields(
+      MessageId,
+      InternetMessageId, OutlookEntryId, Subject, SenderName, SenderEmail,
+      DisplayTo, DisplayCc,
+      SentUtc, RecvUtc, CreateUtc,
+      Headers, BodyText, BodyHtml,
+      LastModNew, SearchKeyRead);
+    FDb.UpdateMessageFolder(MessageId, FolderId);
+  end;
+
+  if Length(RecRows) > 0 then
+    FDb.SaveRecipients(MessageId, RecRows);
+end;
+
+procedure TIngestor.HandleMoveEvent(const Event: TOutlookItemEvent);
+var
+  Folder: OleVariant;
+  FolderId: Integer;
+  FolderPath: string;
+  StoreId: string;
+  MessageId: Integer;
+begin
+  if Event.EntryId = '' then
+    Exit;
+
+  StoreId := Event.TargetStoreId;
+  if StoreId = '' then
+    StoreId := Event.StoreId;
+
+  FolderId := 0;
+  if Event.TargetFolderId <> '' then
+    EnsureFolderByEntryId(Event.TargetFolderId, StoreId, FolderId, FolderPath, Folder);
+
+  if FolderId <> 0 then
+  begin
+    MessageId := FDb.MessageExistsByEntryId(FPstId, Event.EntryId);
+    if MessageId <> 0 then
+      FDb.UpdateMessageFolder(MessageId, FolderId);
+  end;
+
+//  UpsertSingleMessage(Event.EntryId, StoreId, Event.TargetFolderId);
+end;
+
+procedure TIngestor.ProcessEvents(const Events: TArray<TOutlookItemEvent>);
+var
+  Ev: TOutlookItemEvent;
+begin
+  for Ev in Events do
+  begin
+    try
+      case Ev.EventKind of
+        oekAdded, oekChanged:
+          UpsertSingleMessage(Ev.EntryId, Ev.StoreId, Ev.SourceFolderId);
+        oekMoved:
+          HandleMoveEvent(Ev);
+      end;
+    except
+      on E: Exception do
+        if Assigned(FLogger) then
+          FLogger.Warn(Format('Event processing error for %s: %s',
+            [Ev.EntryId, E.Message]));
+    end;
+  end;
 end;
 
 procedure TIngestor.UnloadPST;

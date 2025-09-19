@@ -357,6 +357,9 @@ end;
 procedure TLogger.Error(const Msg: string);
 begin
   Line(lkError, Msg);
+  {$IFDEF DEBUG}
+  OutputDebugString(PChar(Msg));
+  {$ENDIF}
 end;
 
 procedure TLogger.Profile(const Msg: string);
