@@ -529,7 +529,7 @@ function TIngestor.EnsureFolderPath(const OutlookPath: string; out FolderId: Int
   out FolderPath: string): Boolean;
 var
   Segments: TArray<string>;
-  Segment: string;
+  segment, tSegment: string;
   ParentIdVar: Variant;
   CurrPath, CleanPath: string;
   Depth: Integer;
@@ -549,9 +549,9 @@ begin
   CurrPath := '';
   Depth := 0;
 
-  for Segment in Segments do
+  for tSegment in Segments do
   begin
-    Segment := Trim(Segment);
+    Segment := Trim(tSegment);
     if Segment = '' then
       Continue;
 
@@ -636,7 +636,12 @@ begin
     else
       Item := FOlk.Session.GetItemFromID(EntryId);
   except
-    Item := Unassigned;
+    on E: Exception do
+    begin
+      if Assigned(FLogger) then
+        FLogger.Warn(Format('UpsertSingleMessage: Failed to get item with EntryId %s (StoreId: %s). Error: %s', [EntryId, StoreId, E.Message]));
+      Item := Unassigned;
+    end;
   end;
   if not IsVariantAssigned(Item) then
     Exit;
@@ -742,7 +747,7 @@ begin
       FDb.UpdateMessageFolder(MessageId, FolderId);
   end;
 
-  UpsertSingleMessage(Event.EntryId, StoreId, Event.TargetFolderId);
+//  UpsertSingleMessage(Event.EntryId, StoreId, Event.TargetFolderId);
 end;
 
 procedure TIngestor.ProcessEvents(const Events: TArray<TOutlookItemEvent>);

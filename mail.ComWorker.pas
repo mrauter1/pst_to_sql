@@ -1,4 +1,4 @@
-unit mail.ComWorker;
+﻿unit mail.ComWorker;
 
 {
   COM Sync Worker (Delphi 10 Seattle compatible)
@@ -75,6 +75,7 @@ type
     FLastRun: TDateTime;
     FLastError: string;
     FHasRealtimeWork: Boolean;
+    FLastRealtimeSyncFailed: Boolean;
 
     // helpers
     function  DefaultIntervalSec: Cardinal;
@@ -139,7 +140,31 @@ type
 function StarTMailComWorker(const Opts: TCliOptions; IntervalSeconds: Cardinal = 0;
   UpdateMode: TMailUpdateMode = mumIntervalOnly): TMailComWorker;
 procedure RunComSyncWorkerConsole(const Opts: TCliOptions; IntervalSeconds: Cardinal = 0;
-  UpdateMode: TMailUpdateMode = mumIntervalOnly);
+  UpdateMode: TMailUpdateMode = mumRealtimeOnly);
+
+{$IF CompilerVersion <= 30.0} // Delphi 10 Seattle or earlier
+
+// Some SDKs miss these flags
+{$IFNDEF MWMO_INPUTAVAILABLE}
+const
+  MWMO_ALERTABLE      = $0002;
+  MWMO_INPUTAVAILABLE = $0004;
+{$ENDIF}
+
+{$IFNDEF COWAIT_DISPATCH_CALLS}
+const
+  COWAIT_DISPATCH_CALLS  = $00000001;
+  COWAIT_INPUTAVAILABLE  = $00000004;
+{$ENDIF}
+
+// Seattle doesn't always declare CoWaitForMultipleHandles.
+// Declare it ourselves from ole32.dll.
+function CoWaitForMultipleHandles(dwFlags, dwTimeout: DWORD;
+  cHandles: LongWord; pHandles: PHandle; out lpdwIndex: DWORD): HResult; stdcall;
+  external 'ole32.dll';
+
+{$ENDIF}
+
 
 implementation
 
@@ -164,7 +189,7 @@ begin
   FUpdateMode := UpdateMode;
 
   FStopEvent := TEvent.Create(nil, True{manual reset}, False, '');
-  FWakeEvent := TEvent.Create(nil, True{manual reset}, False, '');
+  FWakeEvent := TEvent.Create(nil, False{manual reset}, False, '');
 
   FLogger := nil;
   FDb := nil;
@@ -176,6 +201,7 @@ begin
   FInitialized := False;
   FFirstRunDone := False;
   FHasRealtimeWork := False;
+  FLastRealtimeSyncFailed:= False;
 
   // Safe here (thread not yet running)
   FLastRun := 0;
@@ -215,7 +241,7 @@ begin
   FreeAndNil(FEventListener);
   FreeAndNil(FPendingEvents);
 
-  FCs.Free;
+  FreeAndNil(FCs);
   FreeAndNil(FEventCs);
   inherited;
 end;
@@ -283,7 +309,7 @@ begin
 end;
 
 constructor TMailComWorker.Create(const Opts: TCliOptions;
-  IntervalSeconds: Cardinal; UpdateMode: TMailUpdateMode = mumIntervalOnly);
+  IntervalSeconds: Cardinal = 150; UpdateMode: TMailUpdateMode = mumIntervalOnly);
 begin
   Create(Opts, nil, IntervalSeconds, UpdateMode);
 end;
@@ -398,7 +424,7 @@ begin
 
   try
     FEventListener := TOutlookEventListener.Create(FOlk.Outlook, FOlk.Session,
-      FIngestor.RootFolder, OnOutlookEvent);
+      FIngestor.RootFolder, OnOutlookEvent, FLogger);
     LogInfo('Outlook event listener initialized.');
   except
     on E: Exception do
@@ -447,8 +473,6 @@ begin
   begin
     FEventCs.Enter;
     try
-      if not Assigned(FPendingEvents) then
-        FPendingEvents := TList<TOutlookItemEvent>.Create;
       FPendingEvents.Add(Event);
       FHasRealtimeWork := True;
     finally
@@ -776,12 +800,72 @@ begin
     Reco.Free;
   end;
 end;
+{
+function PumpAndWait(const StopH, WakeH: THandle; TimeoutMs: Cardinal): DWORD;
+var
+  handles: array[0..1] of THandle;
+  r: DWORD;
+  msg: TMsg;
+begin
+  handles[0] := StopH;
+  handles[1] := WakeH;
+
+  while True do
+  begin
+    r := MsgWaitForMultipleObjectsEx(
+           Length(handles),
+           @handles[0],
+           TimeoutMs,                 // use INFINITE for hard block; finite for heartbeats
+           QS_ALLINPUT,
+           MWMO_INPUTAVAILABLE or MWMO_ALERTABLE);
+
+    case r of
+      WAIT_OBJECT_0:         Exit(WAIT_OBJECT_0);           // Stop
+      WAIT_OBJECT_0 + 1:     Exit(WAIT_OBJECT_0 + 1);       // Wake
+      WAIT_TIMEOUT:          Exit(WAIT_TIMEOUT);            // Heartbeat elapsed
+    else
+      // Message(s) pending: pump them so COM events can fire.
+      while PeekMessage(msg, 0, 0, 0, PM_REMOVE) do
+      begin
+        TranslateMessage(msg);
+        DispatchMessage(msg);
+      end;
+      // Loop again to wait on handles or more messages.
+    end;
+  end;
+end;            }
+
+function CoWaitStopOrWake(const StopH, WakeH: THandle; TimeoutMs: DWORD): DWORD;
+var
+  Handles: array[0..1] of THandle;
+  Signaled: DWORD;
+  HR: HResult;
+begin
+  Handles[0] := StopH;
+  Handles[1] := WakeH;
+
+  HR := CoWaitForMultipleHandles(
+          COWAIT_DISPATCH_CALLS or COWAIT_INPUTAVAILABLE,
+          TimeoutMs,
+          Length(Handles),
+          @Handles[0],
+          Signaled);
+  case HR of
+    S_OK: {use Signaled};
+    RPC_S_CALLPENDING: Exit(WAIT_TIMEOUT);
+    RPC_E_SERVERCALL_RETRYLATER, RPC_E_CALL_REJECTED:
+      begin Sleep(50); Exit(WAIT_TIMEOUT); end;
+  else
+    OleCheck(HR); // real failure → raise
+  end;
+end;
 
 { ========================= Thread main ========================= }
 
 procedure TMailComWorker.Execute;
 var
   intervalMs: Cardinal;
+  waitCode: DWORD;
   woke: Boolean;
   needReinit: Boolean;
 begin
@@ -830,11 +914,15 @@ begin
         // Outlook may have been closed between cycles; check proactively.
         if not IsOutlookComActive then
           raise Exception.Create('Outlook COM is not active.');
+
         if FUpdateMode <> mumIntervalOnly then
-          ProcessRealtimeSync;
+          FLastRealtimeSyncFailed := not ProcessRealtimeSync // Update the flag based on success/failure
+        else
+          FLastRealtimeSyncFailed := False; // No realtime processing, so no failure
 
         if (FUpdateMode <> mumRealtimeOnly) or (not FFirstRunDone) then
-          DoOneCycle;
+//          if FUpdateMode <> mumRealtimeOnly then
+            DoOneCycle;
       except
         on E: Exception do
         begin
@@ -846,6 +934,9 @@ begin
 
       if Terminated then
         Break;
+
+      if (waitCode <> WAIT_TIMEOUT) and Assigned(FWakeEvent) then
+        FWakeEvent.ResetEvent;
 
       // If a COM-related error occurred, tear everything down and re-initialize
       // on the next loop iteration (safer than attempting to continue).
@@ -877,9 +968,22 @@ begin
         intervalMs := EffectiveIntervalSec * 1000;
 
       if (FUpdateMode <> mumIntervalOnly) and FHasRealtimeWork then
-        Continue;
+      begin
+        if FLastRealtimeSyncFailed then
+          Sleep(500);
+          Continue;
+      end;
 
-      woke := WaitForNextCycle(intervalMs);
+      if FUpdateMode = mumRealtimeOnly then
+        intervalMs := 5000   // finite heartbeat
+      else
+        intervalMs := EffectiveIntervalSec * 1000;
+
+//      woke := PumpAndWait(FStopEvent.Handle, FWakeEvent.Handle, intervalMs);
+//      woke := CoWaitStopOrWake(FStopEvent.Handle, FWakeEvent.Handle, intervalMs);
+      waitCode := CoWaitStopOrWake(FStopEvent.Handle, FWakeEvent.Handle, intervalMs);
+      // Optional: on WAIT_TIMEOUT do light health checks (IsOutlookComActive, etc.)
+//      woke := WaitForNextCycle(intervalMs);
       if Terminated then
         Break;
 

@@ -12,7 +12,8 @@ uses
   mail.Core in 'mail.Core.pas' {/  mail.ComWorker in 'mail.ComWorker.pas';},
   mail.ComWorker in 'mail.ComWorker.pas',
   mail.FullSync in 'mail.FullSync.pas',
-  mail.Logger in 'mail.Logger.pas';
+  mail.Logger in 'mail.Logger.pas',
+  mail.OutlookEvents in 'mail.OutlookEvents.pas';
 
 const
   cDefaultEnvFile = '.env';

@@ -5,7 +5,7 @@ interface
 uses
   System.SysUtils, System.Classes, System.Generics.Collections, System.Variants,
   Winapi.ActiveX, System.Win.ComObj,
-  mail.TypesUtils;
+  mail.TypesUtils, mail.Logger, WinAPI.Windows;
 
 type
   TOutlookItemEventKind = (oekAdded, oekChanged, oekRemoved, oekMoved);
@@ -28,8 +28,9 @@ type
   TComEventSink = class(TInterfacedObject, IDispatch)
   private
     FOnInvoke: TInvokeMethod;
+    FLogger: TLogger;
   public
-    constructor Create(const AOnInvoke: TInvokeMethod);
+    constructor Create(const AOnInvoke: TInvokeMethod; ALogger: TLogger);
 
     { IDispatch }
     function GetTypeInfoCount(out Count: Integer): HResult; stdcall;
@@ -54,6 +55,7 @@ type
 
   TFolderWatcher = class
   private
+    FLogger: TLogger;
     FListener: TOutlookEventListener;
     FFolder: OleVariant;
     FItems: OleVariant;
@@ -67,7 +69,7 @@ type
     procedure FolderInvoke(DispId: Integer; const Params: TArray<Variant>);
     procedure NotifyAddChange(const Item: OleVariant; const Kind: TOutlookItemEventKind);
   public
-    constructor Create(AListener: TOutlookEventListener; const Folder: OleVariant);
+    constructor Create(AListener: TOutlookEventListener; const Folder: OleVariant; ALogger: TLogger);
     destructor Destroy; override;
   end;
 
@@ -80,12 +82,13 @@ type
     FWatchers: TObjectList<TFolderWatcher>;
     FAppSink: IDispatch;
     FAppConnection: TComConnection;
+    FLogger: TLogger;
 
     procedure ApplicationInvoke(DispId: Integer; const Params: TArray<Variant>);
     procedure BuildWatchers(const Folder: OleVariant);
     procedure Notify(const Event: TOutlookItemEvent);
   public
-    constructor Create(const OutlookApp, Session, RootFolder: OleVariant; const Callback: TOutlookEventProc);
+    constructor Create(const OutlookApp, Session, RootFolder: OleVariant; const Callback: TOutlookEventProc; ALogger: TLogger);
     destructor Destroy; override;
 
     procedure Refresh;
@@ -119,9 +122,10 @@ end;
 
 { ------------------------------ TComEventSink ------------------------------ }
 
-constructor TComEventSink.Create(const AOnInvoke: TInvokeMethod);
+constructor TComEventSink.Create(const AOnInvoke: TInvokeMethod; ALogger: TLogger);
 begin
   inherited Create;
+  FLogger:= ALogger;
   FOnInvoke := AOnInvoke;
 end;
 
@@ -172,8 +176,13 @@ begin
 
     FOnInvoke(DispID, Args);
   except
-    // Swallow exceptions to avoid COM reentrancy issues
-    Result := S_OK;
+    on E: Exception do
+    begin
+      if Assigned(FLogger) then
+        FLogger.Error('TComEventSink.Invoke Error: ' + E.Message);
+
+      Result := S_OK;
+    end;
   end;
 end;
 
@@ -222,13 +231,14 @@ end;
 
 { ------------------------------ TFolderWatcher ------------------------------ }
 
-constructor TFolderWatcher.Create(AListener: TOutlookEventListener; const Folder: OleVariant);
+constructor TFolderWatcher.Create(AListener: TOutlookEventListener; const Folder: OleVariant; ALogger: TLogger);
 var
   ItemsDisp, FolderDisp: IDispatch;
 begin
   inherited Create;
   FListener := AListener;
   FFolder := Folder;
+  FLogger:= ALogger;
   FFolderEntryId := VarToStrDefSafe(Folder.EntryID, '');
   FStoreId := VarToStrDefSafe(Folder.StoreID, '');
 
@@ -241,14 +251,14 @@ begin
   ItemsDisp := VarToDispatch(FItems);
   if ItemsDisp <> nil then
   begin
-    FItemsSink := TComEventSink.Create(ItemsInvoke);
+    FItemsSink := TComEventSink.Create(ItemsInvoke, FLogger);
     FItemsConnection := TComConnection.Create(ItemsDisp, DIID_ItemsEvents, FItemsSink);
   end;
 
   FolderDisp := VarToDispatch(FFolder);
   if FolderDisp <> nil then
   begin
-    FFolderSink := TComEventSink.Create(FolderInvoke);
+    FFolderSink := TComEventSink.Create(FolderInvoke, ALogger);
     FFolderConnection := TComConnection.Create(FolderDisp, DIID_MAPIFolderEvents, FFolderSink);
   end;
 end;
@@ -376,7 +386,7 @@ end;
 { ------------------------------ TOutlookEventListener ------------------------------ }
 
 constructor TOutlookEventListener.Create(const OutlookApp, Session, RootFolder: OleVariant;
-  const Callback: TOutlookEventProc);
+  const Callback: TOutlookEventProc; ALogger: TLogger);
 var
   AppDisp: IDispatch;
 begin
@@ -386,11 +396,12 @@ begin
   FRootFolder := RootFolder;
   FOnEvent := Callback;
   FWatchers := TObjectList<TFolderWatcher>.Create(True);
+  FLogger:= ALogger;
 
   AppDisp := VarToDispatch(FApp);
   if AppDisp <> nil then
   begin
-    FAppSink := TComEventSink.Create(ApplicationInvoke);
+    FAppSink := TComEventSink.Create(ApplicationInvoke, ALogger);
     FAppConnection := TComConnection.Create(AppDisp, DIID_ApplicationEvents_11, FAppSink);
   end;
 
@@ -448,7 +459,7 @@ begin
   if not IsVariantAssigned(Folder) then
     Exit;
 
-  FWatchers.Add(TFolderWatcher.Create(Self, Folder));
+  FWatchers.Add(TFolderWatcher.Create(Self, Folder, FLogger));
 
   try
     SubFolders := Folder.Folders;
