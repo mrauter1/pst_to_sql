@@ -33,25 +33,30 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.SyncObjs, System.Math, System.Diagnostics,
-  System.Variants, FireDac.Stan.Intf,
+  System.Variants, System.Generics.Collections, FireDac.Stan.Intf,
   Winapi.Windows, Winapi.ActiveX,
   System.Win.ComObj,          // OleCheck, GetActiveOleObject, EOleError types
   Mail.TypesUtils,            // TCliOptions, TLogger, helpers
   mail.Core,                  // TOutlookCOM, TIngestor, DetectCurrentPstFolder
   mail.FullSync,              // TMailFullSyncReconciler
   mail.Data,
+  mail.OutlookEvents,
   mail.Logger;                 // TDb
 
 type
+  TMailUpdateMode = (mumIntervalOnly, mumRealtimeOnly, mumHybrid);
+
   { Runs COM synchronization in the background at a fixed interval. }
   TMailComWorker = class(TThread)
   private
     FCs: TCriticalSection;
+    FEventCs: TCriticalSection;
 
     // immutable configuration
     FOpts: TCliOptions;
     FConnectionParams: TStringList;
     FIntervalSec: Cardinal;
+    FUpdateMode: TMailUpdateMode;
 
     // lifetime-owned resources
     FStopEvent: TEvent;       // signaled to stop promptly
@@ -60,6 +65,8 @@ type
     FDb: TDb;                 // created when initialized
     FOlk: TOutlookCOM;        // created when initialized
     FIngestor: TIngestor;     // created when initialized
+    FEventListener: TOutlookEventListener;
+    FPendingEvents: TList<TOutlookItemEvent>;
 
     // state
     FComInitialized: Boolean;
@@ -67,6 +74,7 @@ type
     FFirstRunDone: Boolean;
     FLastRun: TDateTime;
     FLastError: string;
+    FHasRealtimeWork: Boolean;
 
     // helpers
     function  DefaultIntervalSec: Cardinal;
@@ -82,6 +90,12 @@ type
     procedure UninitComIfNeeded;
 
     procedure EnsureEffectivePstPath(var Opts: TCliOptions);
+    procedure EnsureEventInfrastructure;
+    procedure ReleaseEventInfrastructure;
+    procedure OnOutlookEvent(const Event: TOutlookItemEvent);
+    procedure EnqueueEvent(const Event: TOutlookItemEvent);
+    function  SnapshotPendingEvents: TArray<TOutlookItemEvent>;
+    function  ProcessRealtimeSync: Boolean;
     procedure DoOneCycle;
     function  WaitForNextCycle(const TimeoutMs: Cardinal): Boolean;
 
@@ -101,9 +115,11 @@ type
 
   public
     { Create the worker.  }
-    constructor Create(const Opts: TCliOptions; AConnectionParams: TStringList = nil; IntervalSeconds: Cardinal = 150); overload;
-    constructor Create(const Opts: TCliOptions; IntervalSeconds: Cardinal = 150); overload;
-    constructor Create(AConnectionParams: TStringList); overload;
+    constructor Create(const Opts: TCliOptions; AConnectionParams: TStringList = nil;
+      IntervalSeconds: Cardinal = 150; UpdateMode: TMailUpdateMode = mumIntervalOnly); overload;
+    constructor Create(const Opts: TCliOptions; IntervalSeconds: Cardinal = 150;
+      UpdateMode: TMailUpdateMode = mumIntervalOnly); overload;
+    constructor Create(AConnectionParams: TStringList; UpdateMode: TMailUpdateMode = mumIntervalOnly); overload;
     destructor Destroy; override;
 
     { Request an immediate cycle (does not change the fixed schedule). }
@@ -117,10 +133,13 @@ type
     property IntervalSeconds: Cardinal read GetIntervalSeconds write SetIntervalSeconds;
     property LastRun: TDateTime read GetLastRun;
     property LastError: string read GetLastError;
+    property UpdateMode: TMailUpdateMode read FUpdateMode write FUpdateMode;
   end;
 
-function StarTMailComWorker(const Opts: TCliOptions; IntervalSeconds: Cardinal = 0): TMailComWorker;
-procedure RunComSyncWorkerConsole(const Opts: TCliOptions; IntervalSeconds: Cardinal = 0);
+function StarTMailComWorker(const Opts: TCliOptions; IntervalSeconds: Cardinal = 0;
+  UpdateMode: TMailUpdateMode = mumIntervalOnly): TMailComWorker;
+procedure RunComSyncWorkerConsole(const Opts: TCliOptions; IntervalSeconds: Cardinal = 0;
+  UpdateMode: TMailUpdateMode = mumIntervalOnly);
 
 implementation
 
@@ -129,17 +148,20 @@ var
 
 { ========================= Construction / Destruction ========================= }
 
-constructor TMailComWorker.Create(const Opts: TCliOptions; AConnectionParams: TStringList = nil; IntervalSeconds: Cardinal = 150);
+constructor TMailComWorker.Create(const Opts: TCliOptions; AConnectionParams: TStringList = nil;
+  IntervalSeconds: Cardinal = 150; UpdateMode: TMailUpdateMode = mumIntervalOnly);
 begin
   inherited Create(True); // suspended, we will Resume after initialization
 
   FCs := TCriticalSection.Create;
+  FEventCs := TCriticalSection.Create;
 
   FreeOnTerminate := False;
 
   FOpts := Opts;
   FOpts.LogPath:= 'ingest.log';
   SetIntervalSeconds(IntervalSeconds); // protect write via CS
+  FUpdateMode := UpdateMode;
 
   FStopEvent := TEvent.Create(nil, True{manual reset}, False, '');
   FWakeEvent := TEvent.Create(nil, True{manual reset}, False, '');
@@ -148,9 +170,12 @@ begin
   FDb := nil;
   FOlk := nil;
   FIngestor := nil;
+  FEventListener := nil;
+  FPendingEvents := TList<TOutlookItemEvent>.Create;
   FComInitialized := False;
   FInitialized := False;
   FFirstRunDone := False;
+  FHasRealtimeWork := False;
 
   // Safe here (thread not yet running)
   FLastRun := 0;
@@ -187,8 +212,11 @@ begin
   FreeAndNil(FStopEvent);
   FreeAndNil(FWakeEvent);
   FreeAndNil(FLogger);
+  FreeAndNil(FEventListener);
+  FreeAndNil(FPendingEvents);
 
   FCs.Free;
+  FreeAndNil(FEventCs);
   inherited;
 end;
 
@@ -246,18 +274,18 @@ end;
 { ========================= Internal helpers ========================= }
 
 constructor TMailComWorker.Create(
-  AConnectionParams: TStringList);
+  AConnectionParams: TStringList; UpdateMode: TMailUpdateMode = mumIntervalOnly);
 var
   FOpt: TCliOptions;
 begin
   FOpt:= Default(TCliOptions); // FOpt should be empty when not running through CLI
-  Create(FOpt, AConnectionParams, 150);
+  Create(FOpt, AConnectionParams, 150, UpdateMode);
 end;
 
 constructor TMailComWorker.Create(const Opts: TCliOptions;
-  IntervalSeconds: Cardinal);
+  IntervalSeconds: Cardinal; UpdateMode: TMailUpdateMode = mumIntervalOnly);
 begin
-  Create(Opts, nil, IntervalSeconds);
+  Create(Opts, nil, IntervalSeconds, UpdateMode);
 end;
 
 function TMailComWorker.DefaultIntervalSec: Cardinal;
@@ -361,6 +389,205 @@ begin
   end;
 end;
 
+procedure TMailComWorker.EnsureEventInfrastructure;
+begin
+  if (FUpdateMode = mumIntervalOnly) then
+    Exit;
+  if (FEventListener <> nil) or (FIngestor = nil) or (FOlk = nil) then
+    Exit;
+
+  try
+    FEventListener := TOutlookEventListener.Create(FOlk.Outlook, FOlk.Session,
+      FIngestor.RootFolder, OnOutlookEvent);
+    LogInfo('Outlook event listener initialized.');
+  except
+    on E: Exception do
+      LogWarn('Failed to initialize Outlook event listener: ' + E.Message);
+  end;
+end;
+
+procedure TMailComWorker.ReleaseEventInfrastructure;
+begin
+  if Assigned(FEventListener) then
+  begin
+    try
+      LogInfo('Releasing Outlook event listener.');
+    except
+      // ignore logging errors during teardown
+    end;
+    FreeAndNil(FEventListener);
+  end;
+
+  if Assigned(FEventCs) then
+  begin
+    FEventCs.Enter;
+    try
+      if Assigned(FPendingEvents) then
+        FPendingEvents.Clear;
+      FHasRealtimeWork := False;
+    finally
+      FEventCs.Leave;
+    end;
+  end;
+end;
+
+procedure TMailComWorker.OnOutlookEvent(const Event: TOutlookItemEvent);
+begin
+  EnqueueEvent(Event);
+end;
+
+procedure TMailComWorker.EnqueueEvent(const Event: TOutlookItemEvent);
+begin
+  if FUpdateMode = mumIntervalOnly then
+    Exit;
+  if Event.EntryId = '' then
+    Exit;
+
+  if Assigned(FEventCs) then
+  begin
+    FEventCs.Enter;
+    try
+      if not Assigned(FPendingEvents) then
+        FPendingEvents := TList<TOutlookItemEvent>.Create;
+      FPendingEvents.Add(Event);
+      FHasRealtimeWork := True;
+    finally
+      FEventCs.Leave;
+    end;
+  end;
+
+  if Assigned(FWakeEvent) then
+    FWakeEvent.SetEvent;
+end;
+
+function TMailComWorker.SnapshotPendingEvents: TArray<TOutlookItemEvent>;
+begin
+  if not Assigned(FEventCs) then
+    Exit(nil);
+
+  FEventCs.Enter;
+  try
+    if Assigned(FPendingEvents) and (FPendingEvents.Count > 0) then
+    begin
+      Result := FPendingEvents.ToArray;
+      FPendingEvents.Clear;
+    end
+    else
+      Result := nil;
+    FHasRealtimeWork := False;
+  finally
+    FEventCs.Leave;
+  end;
+end;
+
+function TMailComWorker.ProcessRealtimeSync: Boolean;
+  function Priority(const Kind: TOutlookItemEventKind): Integer;
+  begin
+    case Kind of
+      oekMoved:   Result := 3;
+      oekChanged: Result := 2;
+      oekAdded:   Result := 1;
+    else
+      Result := 0;
+    end;
+  end;
+
+  function MergeEvents(const Existing, Incoming: TOutlookItemEvent): TOutlookItemEvent;
+  var
+    Base, Other: TOutlookItemEvent;
+  begin
+    if Priority(Incoming.EventKind) >= Priority(Existing.EventKind) then
+    begin
+      Base := Incoming;
+      Other := Existing;
+    end
+    else
+    begin
+      Base := Existing;
+      Other := Incoming;
+    end;
+
+    if Base.StoreId = '' then
+      Base.StoreId := Other.StoreId;
+    if Base.SourceFolderId = '' then
+      Base.SourceFolderId := Other.SourceFolderId;
+    if Base.TargetFolderId = '' then
+      Base.TargetFolderId := Other.TargetFolderId;
+    if Base.TargetStoreId = '' then
+      Base.TargetStoreId := Other.TargetStoreId;
+
+    Result := Base;
+  end;
+
+var
+  Events, Normalized: TArray<TOutlookItemEvent>;
+  List: TList<TOutlookItemEvent>;
+  IndexByEntry: TDictionary<string, Integer>;
+  Ev: TOutlookItemEvent;
+  idx: Integer;
+begin
+  Result := False;
+  if (FUpdateMode = mumIntervalOnly) or (FIngestor = nil) then
+    Exit;
+
+  Events := SnapshotPendingEvents;
+  if Length(Events) = 0 then
+    Exit;
+
+  List := TList<TOutlookItemEvent>.Create;
+  IndexByEntry := TDictionary<string, Integer>.Create;
+  try
+    for Ev in Events do
+    begin
+      if Ev.EntryId = '' then
+        Continue;
+      if not IndexByEntry.TryGetValue(Ev.EntryId, idx) then
+      begin
+        idx := List.Count;
+        List.Add(Ev);
+        IndexByEntry.Add(Ev.EntryId, idx);
+      end
+      else
+        List[idx] := MergeEvents(List[idx], Ev);
+    end;
+    Normalized := List.ToArray;
+  finally
+    IndexByEntry.Free;
+    List.Free;
+  end;
+
+  if Length(Normalized) = 0 then
+    Exit;
+
+  try
+    FIngestor.ProcessEvents(Normalized);
+    LogInfo(Format('Processed %d Outlook event(s).', [Length(Normalized)]));
+    Result := True;
+  except
+    on E: Exception do
+    begin
+      LogError('Realtime event processing failed: ' + E.Message);
+      if Assigned(FEventCs) then
+      begin
+        FEventCs.Enter;
+        try
+          if Assigned(FPendingEvents) then
+          begin
+            for Ev in Events do
+              FPendingEvents.Add(Ev);
+            FHasRealtimeWork := True;
+          end;
+        finally
+          FEventCs.Leave;
+        end;
+      end;
+      if Assigned(FWakeEvent) then
+        FWakeEvent.SetEvent;
+      Result := False;
+    end;
+  end;
+end;
+
 procedure TMailComWorker.InitComponents;
 begin
   // COM must be initialized at this point
@@ -406,12 +633,15 @@ begin
     LogInfo(Format('Attached PST "%s" (pst_id=%d).', [FIngestor.RootDisplay, FIngestor.PstId]));
   end;
 
+  EnsureEventInfrastructure;
+
   FInitialized := True;
 end;
 
 procedure TMailComWorker.TearDownComponents;
 begin
   // Important: free high-level objects first, then Outlook/DB, then COM.
+  ReleaseEventInfrastructure;
   if Assigned(FIngestor) then
   begin
     try
@@ -600,8 +830,11 @@ begin
         // Outlook may have been closed between cycles; check proactively.
         if not IsOutlookComActive then
           raise Exception.Create('Outlook COM is not active.');
+        if FUpdateMode <> mumIntervalOnly then
+          ProcessRealtimeSync;
 
-        DoOneCycle;
+        if (FUpdateMode <> mumRealtimeOnly) or (not FFirstRunDone) then
+          DoOneCycle;
       except
         on E: Exception do
         begin
@@ -638,7 +871,14 @@ begin
       end;
 
       // Normal wait for the next cycle (or an external trigger)
-      intervalMs := EffectiveIntervalSec * 1000;
+      if FUpdateMode = mumRealtimeOnly then
+        intervalMs := INFINITE
+      else
+        intervalMs := EffectiveIntervalSec * 1000;
+
+      if (FUpdateMode <> mumIntervalOnly) and FHasRealtimeWork then
+        Continue;
+
       woke := WaitForNextCycle(intervalMs);
       if Terminated then
         Break;
@@ -651,7 +891,7 @@ begin
   except
     on E: Exception do
     begin
-      // Last resort catch — still never propagate to the main thread.
+      // Last resort catch Â— still never propagate to the main thread.
       SetLastError(E.Message);
       LogError('Unexpected thread error: ' + E.Message);
     end;
@@ -712,15 +952,17 @@ begin
   end;
 end;
 
-function StarTMailComWorker(const Opts: TCliOptions; IntervalSeconds: Cardinal): TMailComWorker;
+function StarTMailComWorker(const Opts: TCliOptions; IntervalSeconds: Cardinal;
+  UpdateMode: TMailUpdateMode): TMailComWorker;
 begin
   // Creates and starts the worker thread. The thread owns COM, DB and Outlook objects.
   // Keep the instance alive for as long as you want the sync to run.
-  Result := TMailComWorker.Create(Opts, IntervalSeconds);
+  Result := TMailComWorker.Create(Opts, IntervalSeconds, UpdateMode);
   Result.Start;
 end;
 
-procedure RunComSyncWorkerConsole(const Opts: TCliOptions; IntervalSeconds: Cardinal);
+procedure RunComSyncWorkerConsole(const Opts: TCliOptions; IntervalSeconds: Cardinal;
+  UpdateMode: TMailUpdateMode);
 var
   Worker: TMailComWorker;
 begin
@@ -728,7 +970,7 @@ begin
   //  - starts the worker
   //  - pumps queued calls (CheckSynchronize)
   //  - exits cleanly on Ctrl+C / console close
-  Worker := StarTMailComWorker(Opts, IntervalSeconds);
+  Worker := StarTMailComWorker(Opts, IntervalSeconds, UpdateMode);
   try
     GStopEvent := TEvent.Create(nil, True{manual reset}, False, '');
     SetConsoleCtrlHandler(@ConsoleCtrlHandler, True);

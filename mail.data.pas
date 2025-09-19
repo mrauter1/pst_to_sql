@@ -59,6 +59,7 @@ type
       const SentUTC, ReceivedUTC, CreatedUTC: TDateTime;
       const TransportHeaders, BodyText, BodyHtml: string;
       const LastModUtc: TDateTime; const SearchKey: TBytes);
+    procedure UpdateMessageFolder(const MessageId, FolderId: Integer);
 
     procedure InsertRecipient(const MessageId, Kind: Integer; const DisplayName, Email: string);
 
@@ -120,7 +121,7 @@ begin
 
   FConn.TxOptions.AutoCommit := True;      // commit after every statement
   FConn.TxOptions.AutoStart  := False;     // do not wrap SELECTs in long txns
-  FConn.TxOptions.Isolation  := xiReadCommitted; // relies on RCSI (see ง1)
+  FConn.TxOptions.Isolation  := xiReadCommitted; // relies on RCSI (see ยง1)
 //  FConn.TxOptions.DisconnectAction := xdRollback;
 
   FQ := TFDQuery.Create(nil);
@@ -847,6 +848,17 @@ begin
   else
     FQ.ParamByName('sk').SetData(PByte(@SearchKey[0]), LongWord(Length(SearchKey)));
 
+  FQ.ExecSQL;
+end;
+
+procedure TDb.UpdateMessageFolder(const MessageId, FolderId: Integer);
+begin
+  FQ.Close;
+  FQ.SQL.Text :=
+    'UPDATE mail.message SET folder_id = :fid WHERE message_id = :mid';
+  FQ.Params.Clear;
+  SetParam('fid', ftInteger, FolderId);
+  SetParam('mid', ftInteger, MessageId);
   FQ.ExecSQL;
 end;
 

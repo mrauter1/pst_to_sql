@@ -139,6 +139,7 @@
         <DCCReference Include="mail.Core.pas">
             <Form>/  mail.ComWorker in &apos;mail.ComWorker.pas&apos;;</Form>
         </DCCReference>
+        <DCCReference Include="mail.OutlookEvents.pas"/>
         <DCCReference Include="mail.ComWorker.pas"/>
         <DCCReference Include="mail.FullSync.pas"/>
         <DCCReference Include="mail.Logger.pas"/>
