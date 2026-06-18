@@ -597,11 +597,9 @@ begin
           SelQ.Next;
         end;
         SelQ.Close;
-
-        // drop temp table explicitly
-        SelQ.SQL.Text := 'DROP TABLE #probe';
-        try SelQ.ExecSQL; except end;
       finally
+        // drop temp table explicitly
+        try SelQ.SQL.Text := 'DROP TABLE #probe'; SelQ.ExecSQL; except end;
         SelQ.Free;
         InsQ.Free;
       end;
@@ -1374,6 +1372,12 @@ begin
     SW.Stop;
     Logger.Info(Format('ProcessFolder completed in %d ms (%.3f s).',
       [SW.ElapsedMilliseconds, SW.Elapsed.TotalSeconds]));
+
+    try
+      if DB.Conn.InTransaction then
+        DB.Conn.Commit;
+    except
+    end;
   end;
   Logger.Info('Full reconcile complete.');
 end;

@@ -95,6 +95,7 @@ type
     procedure SetLastRun(const Value: TDateTime);
     procedure SetLastError(const Value: string);
     procedure LogProfile(const S: string);
+    function GetIntervalMilliSeconds: Integer;
 
   protected
     procedure Execute; override;
@@ -547,6 +548,11 @@ begin
   end;
 end;
 
+function TMailComWorker.GetIntervalMilliSeconds: Integer;
+begin
+  Result:= DefaultIntervalSec * 1000;
+end;
+
 { ========================= Thread main ========================= }
 
 procedure TMailComWorker.Execute;
@@ -586,7 +592,7 @@ begin
             except end;
 
             // Wait a short backoff before retrying initialization
-            if FStopEvent.WaitFor(3000) = wrSignaled then
+            if FStopEvent.WaitFor(GetIntervalMilliSeconds) = wrSignaled then
               Break;
 
             Continue; // attempt to init again
@@ -631,15 +637,14 @@ begin
         end;
 
         // Small pause before next re-init attempt
-        if FStopEvent.WaitFor(2000) = wrSignaled then
+        if FStopEvent.WaitFor(GetIntervalMilliSeconds) = wrSignaled then
           Break;
 
         Continue;
       end;
 
       // Normal wait for the next cycle (or an external trigger)
-      intervalMs := EffectiveIntervalSec * 1000;
-      woke := WaitForNextCycle(intervalMs);
+      woke := WaitForNextCycle(GetIntervalMilliSeconds);
       if Terminated then
         Break;
 

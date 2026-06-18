@@ -24,6 +24,7 @@ type
     procedure UpdatePSTLastUpdatedData(const pst_id: Integer);
     procedure LoadConnectionParamFromEnv;
     procedure LoadConnectionParamsFromConnOverride(const AConnOverride: String);
+    procedure ConnectionAfterOpen(Sender: TObject);
 
     property Q: TFDQuery read FQ;
   public
@@ -88,6 +89,8 @@ type
     property Conn: TFDConnection read FConn;
   end;
 
+procedure OpenOrAutoRollback(AQuery: TFDQuery; ASql: String='');
+
 const
   OPT_SAVE_BODY_HTML = False;
 
@@ -95,6 +98,23 @@ implementation
 
 uses
   System.StrUtils, System.IOUtils, FireDAC.Comp.DataSet, Variants;
+
+procedure OpenOrAutoRollback(AQuery: TFDQuery; ASql: String='');
+begin
+  try
+    if ASql<>'' then
+      AQuery.Open(ASql)
+    else
+      AQuery.Open;
+
+  except
+    if AQuery.Connection.InTransaction then
+      AQuery.Connection.Rollback;
+
+    raise;
+  end;
+
+end;
 
 function VIfThen(AValue: Boolean; ATrue: Variant; AFalse: Variant): Variant;
 begin
@@ -112,11 +132,17 @@ begin
   Result := (V = 'yes') or (V = 'true') or (V = '1') or (V = 'y');
 end;
 
+procedure TDb.ConnectionAfterOpen(Sender: TObject);
+begin
+  FConn.ExecSQL('SET IMPLICIT_TRANSACTIONS OFF; SET XACT_ABORT ON; SET LOCK_TIMEOUT 30000;');
+end;
+
 constructor TDb.Create;
 begin
   inherited Create;
   FConn := TFDConnection.Create(nil);
   FConn.LoginPrompt := False;
+  FConn.AfterConnect:= ConnectionAfterOpen;
 
   FConn.TxOptions.AutoCommit := True;      // commit after every statement
   FConn.TxOptions.AutoStart  := False;     // do not wrap SELECTs in long txns
@@ -226,7 +252,7 @@ begin
     if GetEnv('SQL_ENCRYPT', '') <> '' then
       FConn.Params.Values['Encrypt'] := GetEnv('SQL_ENCRYPT', 'yes');
     if GetEnv('SQL_TRUST_SERVER_CERTIFICATE', '') <> '' then
-      FConn.Params.Values['TrustServerCertificate'] := GetEnv('SQL_TRUST_SERVER_CERTIFICATE', 'no');
+      FConn.Params.Values['ODBCAdvanced'] := 'TrustServerCertificate=yes';
   end;
 end;
 
@@ -279,12 +305,14 @@ end;
 
 procedure TDb.Commit;
 begin
-  FConn.Commit;
+  if FConn.InTransaction then
+    FConn.Commit;
 end;
 
 procedure TDb.Rollback;
 begin
-  FConn.Rollback;
+  if FConn.InTransaction then
+    FConn.Rollback;
 end;
 
 procedure TDb.EnsureParam(const AName: string; ADataType: TFieldType);
@@ -555,95 +583,98 @@ begin
   Q   := TFDQuery.Create(nil);
   Ins := TFDQuery.Create(nil);
   try
-    Q.Connection   := FConn;
-    Ins.Connection := FConn;
+    try
+      Q.Connection   := FConn;
+      Ins.Connection := FConn;
 
-    // Temp table to stage recipients for this message
-    Q.SQL.Text := 'CREATE TABLE #rec (kind INT NOT NULL, display_name NVARCHAR(400) NULL, email NVARCHAR(320) NULL)';
-    Q.ExecSQL;
+      // Temp table to stage recipients for this message
+      Q.SQL.Text := 'CREATE TABLE #rec (kind INT NOT NULL, display_name NVARCHAR(400) NULL, email NVARCHAR(320) NULL)';
+      Q.ExecSQL;
 
-    // ArrayDML into #rec
-    Ins.SQL.Text := 'INSERT INTO #rec(kind, display_name, email) VALUES (:k, :d, :e)';
-    Ins.Params.Clear;
-    Ins.Params.Add.Name := 'k';
-    Ins.ParamByName('k').DataType := ftInteger;
-    Ins.Params.Add.Name := 'd';
-    Ins.ParamByName('d').DataType := ftWideString;
-    Ins.Params.Add.Name := 'e';
-    Ins.ParamByName('e').DataType := ftWideString;
+      // ArrayDML into #rec
+      Ins.SQL.Text := 'INSERT INTO #rec(kind, display_name, email) VALUES (:k, :d, :e)';
+      Ins.Params.Clear;
+      Ins.Params.Add.Name := 'k';
+      Ins.ParamByName('k').DataType := ftInteger;
+      Ins.Params.Add.Name := 'd';
+      Ins.ParamByName('d').DataType := ftWideString;
+      Ins.Params.Add.Name := 'e';
+      Ins.ParamByName('e').DataType := ftWideString;
 
-    Ins.Params.ArraySize := N;
-    for i := 0 to N - 1 do
-    begin
-      // kind
-      if VarIsNull(RecRows[i][0]) or VarIsEmpty(RecRows[i][0]) then
-        Ins.ParamByName('k').AsIntegers[i] := 1
-      else
-        Ins.ParamByName('k').AsIntegers[i] := Integer(RecRows[i][0]);
-
-      // display_name
-      if VarToStrDefSafe(RecRows[i][1], '') <> '' then
-        Ins.ParamByName('d').AsStrings[i] := VarToStrDefSafe(RecRows[i][1], '')
-      else
-        Ins.ParamByName('d').Clear(i);
-
-      // email
-      if VarToStrDefSafe(RecRows[i][2], '') <> '' then
-        Ins.ParamByName('e').AsStrings[i] := VarToStrDefSafe(RecRows[i][2], '')
-      else
-        Ins.ParamByName('e').Clear(i);
-    end;
-    Ins.Execute(N, 0);
-
-    // Insert distinct staged rows that do not already exist for this message (NULL-safe email match, case-insensitive)
-    Q.SQL.Text :=
-      'WITH x AS (' + sLineBreak +
-      '  SELECT kind, display_name, email,' + sLineBreak +
-      '         ROW_NUMBER() OVER (PARTITION BY kind, LOWER(COALESCE(email, '''')) ORDER BY (SELECT 0)) rn' + sLineBreak +
-      '  FROM #rec' + sLineBreak +
-      ')' + sLineBreak +
-      'INSERT INTO mail.recipient(message_id, kind, display_name, email)' + sLineBreak +
-      'SELECT :m, x.kind, x.display_name, x.email' + sLineBreak +
-      'FROM x' + sLineBreak +
-      'WHERE x.rn = 1' + sLineBreak +
-      '  AND NOT EXISTS (' + sLineBreak +
-      '        SELECT 1 FROM mail.recipient r' + sLineBreak +
-      '        WHERE r.message_id = :m' + sLineBreak +
-      '          AND r.kind = x.kind' + sLineBreak +
-      '          AND ( (r.email IS NULL AND x.email IS NULL)' + sLineBreak +
-      '             OR (r.email IS NOT NULL AND x.email IS NOT NULL AND LOWER(r.email) = LOWER(x.email)) )' + sLineBreak +
-      '      )';
-    Q.Params.Clear;
-    Q.Params.Add.Name := 'm';
-    Q.ParamByName('m').DataType := ftInteger;
-    Q.ParamByName('m').AsInteger := MessageId;
-    Q.ExecSQL;
-
-    // Drop temp table explicitly
-    Q.SQL.Text := 'DROP TABLE #rec';
-    try Q.ExecSQL; except end;
-  except
-    // Conservative fallback to the previous row-by-row path if anything goes wrong.
-    on E: Exception do
-    begin
-      try
-        // best-effort cleanup of temp table if it exists
-        Q.SQL.Text := 'IF OBJECT_ID(''tempdb..#rec'') IS NOT NULL DROP TABLE #rec';
-        try Q.ExecSQL; except end;
-      except end;
-
-      // Fallback to the old logic (preserves behavior & avoids breaking existing flows)
+      Ins.Params.ArraySize := N;
       for i := 0 to N - 1 do
-        InsertRecipient(
-          MessageId,
-          VarToIntDefSafe(RecRows[i][0], 1),
-          VarToStrDefSafe(RecRows[i][1], ''),
-          VarToStrDefSafe(RecRows[i][2], ''));
+      begin
+        // kind
+        if VarIsNull(RecRows[i][0]) or VarIsEmpty(RecRows[i][0]) then
+          Ins.ParamByName('k').AsIntegers[i] := 1
+        else
+          Ins.ParamByName('k').AsIntegers[i] := Integer(RecRows[i][0]);
+
+        // display_name
+        if VarToStrDefSafe(RecRows[i][1], '') <> '' then
+          Ins.ParamByName('d').AsStrings[i] := VarToStrDefSafe(RecRows[i][1], '')
+        else
+          Ins.ParamByName('d').Clear(i);
+
+        // email
+        if VarToStrDefSafe(RecRows[i][2], '') <> '' then
+          Ins.ParamByName('e').AsStrings[i] := VarToStrDefSafe(RecRows[i][2], '')
+        else
+          Ins.ParamByName('e').Clear(i);
+      end;
+      Ins.Execute(N, 0);
+
+      // Insert distinct staged rows that do not already exist for this message (NULL-safe email match, case-insensitive)
+      Q.SQL.Text :=
+        'WITH x AS (' + sLineBreak +
+        '  SELECT kind, display_name, email,' + sLineBreak +
+        '         ROW_NUMBER() OVER (PARTITION BY kind, LOWER(COALESCE(email, '''')) ORDER BY (SELECT 0)) rn' + sLineBreak +
+        '  FROM #rec' + sLineBreak +
+        ')' + sLineBreak +
+        'INSERT INTO mail.recipient(message_id, kind, display_name, email)' + sLineBreak +
+        'SELECT :m, x.kind, x.display_name, x.email' + sLineBreak +
+        'FROM x' + sLineBreak +
+        'WHERE x.rn = 1' + sLineBreak +
+        '  AND NOT EXISTS (' + sLineBreak +
+        '        SELECT 1 FROM mail.recipient r' + sLineBreak +
+        '        WHERE r.message_id = :m' + sLineBreak +
+        '          AND r.kind = x.kind' + sLineBreak +
+        '          AND ( (r.email IS NULL AND x.email IS NULL)' + sLineBreak +
+        '             OR (r.email IS NOT NULL AND x.email IS NOT NULL AND LOWER(r.email) = LOWER(x.email)) )' + sLineBreak +
+        '      )';
+      Q.Params.Clear;
+      Q.Params.Add.Name := 'm';
+      Q.ParamByName('m').DataType := ftInteger;
+      Q.ParamByName('m').AsInteger := MessageId;
+      Q.ExecSQL;
+
+    except
+      // Conservative fallback to the previous row-by-row path if anything goes wrong.
+      on E: Exception do
+      begin
+        try
+          // best-effort cleanup of temp table if it exists
+          Q.SQL.Text := 'IF OBJECT_ID(''tempdb..#rec'') IS NOT NULL DROP TABLE #rec';
+          try Q.ExecSQL; except end;
+        except end;
+
+        // Fallback to the old logic (preserves behavior & avoids breaking existing flows)
+        for i := 0 to N - 1 do
+          InsertRecipient(
+            MessageId,
+            VarToIntDefSafe(RecRows[i][0], 1),
+            VarToStrDefSafe(RecRows[i][1], ''),
+            VarToStrDefSafe(RecRows[i][2], ''));
+      end;
     end;
+  finally
+    // Drop temp table explicitly
+    try Q.SQL.Text := 'DROP TABLE #rec'; Q.ExecSQL; except end;
+    Ins.Free;
+    Q.Free;
   end;
 
-  Ins.Free;
-  Q.Free;
+
 end;
 
 // NEW: multi-message batch variant
@@ -680,118 +711,122 @@ begin
   Q   := TFDQuery.Create(nil);
   Ins := TFDQuery.Create(nil);
   try
-    Q.Connection   := FConn;
-    Ins.Connection := FConn;
+    try
+      Q.Connection   := FConn;
+      Ins.Connection := FConn;
 
-    // Staging table for all recipients (across many messages)
-    Q.SQL.Text :=
-      'CREATE TABLE #rec2(' +
-      '  message_id INT NOT NULL,' +
-      '  kind INT NOT NULL,' +
-      '  display_name NVARCHAR(400) NULL,' +
-      '  email NVARCHAR(320) NULL' +
-      ')';
-    Q.ExecSQL;
+      // Staging table for all recipients (across many messages)
+      Q.SQL.Text :=
+        'CREATE TABLE #rec2(' +
+        '  message_id INT NOT NULL,' +
+        '  kind INT NOT NULL,' +
+        '  display_name NVARCHAR(400) NULL,' +
+        '  email NVARCHAR(320) NULL' +
+        ')';
+      Q.ExecSQL;
 
-    // ArrayDML into the staging table
-    Ins.SQL.Text := 'INSERT INTO #rec2(message_id, kind, display_name, email) VALUES (:m,:k,:d,:e)';
-    Ins.Params.Clear;
-    Ins.Params.Add.Name := 'm'; Ins.ParamByName('m').DataType := ftInteger;
-    Ins.Params.Add.Name := 'k'; Ins.ParamByName('k').DataType := ftInteger;
-    Ins.Params.Add.Name := 'd'; Ins.ParamByName('d').DataType := ftWideString;
-    Ins.Params.Add.Name := 'e'; Ins.ParamByName('e').DataType := ftWideString;
+      // ArrayDML into the staging table
+      Ins.SQL.Text := 'INSERT INTO #rec2(message_id, kind, display_name, email) VALUES (:m,:k,:d,:e)';
+      Ins.Params.Clear;
+      Ins.Params.Add.Name := 'm'; Ins.ParamByName('m').DataType := ftInteger;
+      Ins.Params.Add.Name := 'k'; Ins.ParamByName('k').DataType := ftInteger;
+      Ins.Params.Add.Name := 'd'; Ins.ParamByName('d').DataType := ftWideString;
+      Ins.Params.Add.Name := 'e'; Ins.ParamByName('e').DataType := ftWideString;
 
-    done := 0;
-    mIdx := 0; rIdx := 0;
+      done := 0;
+      mIdx := 0; rIdx := 0;
 
-    while done < total do
-    begin
-      nThis := CHUNK;
-      if nThis > (total - done) then
-        nThis := total - done;
-
-      Ins.Params.ArraySize := nThis;
-      iThis := 0;
-
-      while iThis < nThis do
+      while done < total do
       begin
-        // advance to next message that still has rows
-        while (mIdx < Length(MessageIds)) and (rIdx >= Length(RecRowsPerMessage[mIdx])) do
+        nThis := CHUNK;
+        if nThis > (total - done) then
+          nThis := total - done;
+
+        Ins.Params.ArraySize := nThis;
+        iThis := 0;
+
+        while iThis < nThis do
         begin
-          Inc(mIdx);
-          rIdx := 0;
+          // advance to next message that still has rows
+          while (mIdx < Length(MessageIds)) and (rIdx >= Length(RecRowsPerMessage[mIdx])) do
+          begin
+            Inc(mIdx);
+            rIdx := 0;
+          end;
+          if mIdx >= Length(MessageIds) then
+            Break; // safety
+
+          row := RecRowsPerMessage[mIdx][rIdx];
+
+          // message_id
+          Ins.ParamByName('m').AsIntegers[iThis] := MessageIds[mIdx];
+
+          // kind
+          if VarIsNull(row[0]) or VarIsEmpty(row[0]) then
+            Ins.ParamByName('k').AsIntegers[iThis] := 1
+          else
+            Ins.ParamByName('k').AsIntegers[iThis] := Integer(row[0]);
+
+          // display_name
+          if VarToStrDefSafe(row[1], '') <> '' then
+            Ins.ParamByName('d').AsStrings[iThis] := VarToStrDefSafe(row[1], '')
+          else
+            Ins.ParamByName('d').Clear(iThis);
+
+          // email
+          if VarToStrDefSafe(row[2], '') <> '' then
+            Ins.ParamByName('e').AsStrings[iThis] := VarToStrDefSafe(row[2], '')
+          else
+            Ins.ParamByName('e').Clear(iThis);
+
+          Inc(rIdx);
+          Inc(iThis);
+          Inc(done);
         end;
-        if mIdx >= Length(MessageIds) then
-          Break; // safety
 
-        row := RecRowsPerMessage[mIdx][rIdx];
-
-        // message_id
-        Ins.ParamByName('m').AsIntegers[iThis] := MessageIds[mIdx];
-
-        // kind
-        if VarIsNull(row[0]) or VarIsEmpty(row[0]) then
-          Ins.ParamByName('k').AsIntegers[iThis] := 1
-        else
-          Ins.ParamByName('k').AsIntegers[iThis] := Integer(row[0]);
-
-        // display_name
-        if VarToStrDefSafe(row[1], '') <> '' then
-          Ins.ParamByName('d').AsStrings[iThis] := VarToStrDefSafe(row[1], '')
-        else
-          Ins.ParamByName('d').Clear(iThis);
-
-        // email
-        if VarToStrDefSafe(row[2], '') <> '' then
-          Ins.ParamByName('e').AsStrings[iThis] := VarToStrDefSafe(row[2], '')
-        else
-          Ins.ParamByName('e').Clear(iThis);
-
-        Inc(rIdx);
-        Inc(iThis);
-        Inc(done);
+        if iThis > 0 then
+          Ins.Execute(iThis, 0);
       end;
 
-      if iThis > 0 then
-        Ins.Execute(iThis, 0);
+      // One set-based insert with per-(message_id, kind, email) dedup + NOT EXISTS against target
+      Q.SQL.Text :=
+        'WITH x AS (' + sLineBreak +
+        '  SELECT message_id, kind, display_name, email,' + sLineBreak +
+        '         ROW_NUMBER() OVER (PARTITION BY message_id, kind, LOWER(COALESCE(email, ''''))' + sLineBreak +
+        '                             ORDER BY (SELECT 0)) rn' + sLineBreak +
+        '  FROM #rec2' + sLineBreak +
+        ')' + sLineBreak +
+        'INSERT INTO mail.recipient(message_id, kind, display_name, email)' + sLineBreak +
+        'SELECT x.message_id, x.kind, x.display_name, x.email' + sLineBreak +
+        'FROM x' + sLineBreak +
+        'WHERE x.rn = 1' + sLineBreak +
+        '  AND NOT EXISTS (' + sLineBreak +
+        '        SELECT 1 FROM mail.recipient r' + sLineBreak +
+        '        WHERE r.message_id = x.message_id' + sLineBreak +
+        '          AND r.kind = x.kind' + sLineBreak +
+        '          AND ( (r.email IS NULL AND x.email IS NULL)' + sLineBreak +
+        '             OR (r.email IS NOT NULL AND x.email IS NOT NULL AND LOWER(r.email) = LOWER(x.email)) )' + sLineBreak +
+        '      )';
+      Q.ExecSQL;
+
+    except
+      on E: Exception do
+      begin
+        // Clean up temp table if it exists
+        try DropTemp; except end;
+
+        // Fallback to safe row-by-row path (keeps behavior intact)
+        for i := 0 to High(MessageIds) do
+          Self.SaveRecipients(MessageIds[i], RecRowsPerMessage[i]);
+      end;
     end;
-
-    // One set-based insert with per-(message_id, kind, email) dedup + NOT EXISTS against target
-    Q.SQL.Text :=
-      'WITH x AS (' + sLineBreak +
-      '  SELECT message_id, kind, display_name, email,' + sLineBreak +
-      '         ROW_NUMBER() OVER (PARTITION BY message_id, kind, LOWER(COALESCE(email, ''''))' + sLineBreak +
-      '                             ORDER BY (SELECT 0)) rn' + sLineBreak +
-      '  FROM #rec2' + sLineBreak +
-      ')' + sLineBreak +
-      'INSERT INTO mail.recipient(message_id, kind, display_name, email)' + sLineBreak +
-      'SELECT x.message_id, x.kind, x.display_name, x.email' + sLineBreak +
-      'FROM x' + sLineBreak +
-      'WHERE x.rn = 1' + sLineBreak +
-      '  AND NOT EXISTS (' + sLineBreak +
-      '        SELECT 1 FROM mail.recipient r' + sLineBreak +
-      '        WHERE r.message_id = x.message_id' + sLineBreak +
-      '          AND r.kind = x.kind' + sLineBreak +
-      '          AND ( (r.email IS NULL AND x.email IS NULL)' + sLineBreak +
-      '             OR (r.email IS NOT NULL AND x.email IS NOT NULL AND LOWER(r.email) = LOWER(x.email)) )' + sLineBreak +
-      '      )';
-    Q.ExecSQL;
-
+  finally
     DropTemp;
-  except
-    on E: Exception do
-    begin
-      // Clean up temp table if it exists
-      try DropTemp; except end;
-
-      // Fallback to safe row-by-row path (keeps behavior intact)
-      for i := 0 to High(MessageIds) do
-        Self.SaveRecipients(MessageIds[i], RecRowsPerMessage[i]);
-    end;
+    Ins.Free;
+    Q.Free;
   end;
 
-  Ins.Free;
-  Q.Free;
+
 end;
 
 procedure TDb.UpdateMessageCoreFields(
@@ -1042,10 +1077,8 @@ begin
       Q.Next;
     end;
     Q.Close;
-
-    Q.SQL.Text := 'DROP TABLE #sk';
-    try Q.ExecSQL; except end;
   finally
+    try Q.SQL.Text := 'DROP TABLE #sk'; Q.ExecSQL; except end;
     Q.Free;
     Ins.Free;
   end;
@@ -1101,9 +1134,8 @@ begin
     end;
     Q.Close;
 
-    Q.SQL.Text := 'DROP TABLE #ids';
-    try Q.ExecSQL; except end;
   finally
+    try Q.SQL.Text := 'DROP TABLE #ids'; Q.ExecSQL; except end;
     Q.Free;
     Ins.Free;
   end;

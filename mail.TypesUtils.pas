@@ -48,6 +48,12 @@ type
     Description: string;
   end;
 
+  TOutlookGuardWriteResult = record
+    RegistryPath: string;
+    Success: Boolean;
+    ErrorMessage: string;
+  end;
+
 const
   // Outlook proptags (Unicode string type ...001F unless noted)
   PR_TRANSPORT_HEADERS    = 'http://schemas.microsoft.com/mapi/proptag/0x007D001F';
@@ -143,7 +149,15 @@ function GetLatestOutlookOfficeVersion: string;
 function ReadEffectiveOutlookObjectModelGuard(
   const AOfficeVersion: string = ''): TOutlookGuardResult;
 
-// 0,1,2 or -1 if not applicable
+procedure SetOutlookObjectModelGuardMachine(const AOfficeVersion: string;
+  const AValue: Integer; out AWriteResults: TArray<TOutlookGuardWriteResult>);
+
+procedure SetOutlookObjectModelGuardPolicyCurrentUser(const AOfficeVersion: string;
+  out AWriteResults: TArray<TOutlookGuardWriteResult>);
+
+function IsOutlookObjectModelGuardNeverWarn(const AGuardState: TOutlookGuardResult): Boolean;
+
+// 0,1,2 or -1 if not applicable. Policy mode returns 2 when all tracked prompts auto-approve.
 function GetOutlookObjectModelGuardValue(const AOfficeVersion: string = ''): Integer;
 
 implementation
@@ -1076,6 +1090,195 @@ begin
   end;
 end;
 
+type
+  TOutlookGuardWriteTarget = record
+    SubKey: string;
+    RegistryPath: string;
+    Access: Cardinal;
+    CreateKey: Boolean;
+  end;
+
+function HKLM_KeyExists(const SubKey: string; const Access: Cardinal): Boolean;
+var
+  Reg: TRegistry;
+begin
+  Reg := TRegistry.Create(KEY_READ or Access);
+  try
+    Reg.RootKey := HKEY_LOCAL_MACHINE;
+    Result := Reg.OpenKeyReadOnly(SubKey);
+  finally
+    Reg.Free;
+  end;
+end;
+
+function HKLMDisplayPathForView(const SubKey: string; const Access: Cardinal): string;
+const
+  SoftwarePrefix = 'SOFTWARE\';
+begin
+  if (Access = KEY_WOW64_32KEY) and
+     SameText(Copy(SubKey, 1, Length(SoftwarePrefix)), SoftwarePrefix) then
+    Result := 'HKLM:\SOFTWARE\Wow6432Node\' +
+      Copy(SubKey, Length(SoftwarePrefix) + 1, MaxInt)
+  else
+    Result := 'HKLM:\' + SubKey;
+end;
+
+procedure AddOutlookGuardWriteTarget(var ATargets: TArray<TOutlookGuardWriteTarget>;
+  const ASubKey: string; const AAccess: Cardinal; const ACreateKey: Boolean);
+var
+  L: Integer;
+begin
+  L := Length(ATargets);
+  SetLength(ATargets, L + 1);
+  ATargets[L].SubKey := ASubKey;
+  ATargets[L].RegistryPath := HKLMDisplayPathForView(ASubKey, AAccess);
+  ATargets[L].Access := AAccess;
+  ATargets[L].CreateKey := ACreateKey;
+end;
+
+procedure WriteHKLM_DWORD(const SubKey, ValueName: string; const Value: Integer;
+  const Access: Cardinal; const CreateKey: Boolean);
+var
+  Reg: TRegistry;
+begin
+  Reg := TRegistry.Create(KEY_WRITE or Access);
+  try
+    Reg.RootKey := HKEY_LOCAL_MACHINE;
+    if not Reg.OpenKey(SubKey, CreateKey) then
+      raise Exception.Create('Unable to open HKLM:\' + SubKey);
+    Reg.WriteInteger(ValueName, Value);
+  finally
+    Reg.Free;
+  end;
+end;
+
+procedure WriteHKCU_DWORD(const SubKey, ValueName: string; const Value: Integer;
+  const CreateKey: Boolean);
+var
+  Reg: TRegistry;
+begin
+  Reg := TRegistry.Create(KEY_WRITE);
+  try
+    Reg.RootKey := HKEY_CURRENT_USER;
+    if not Reg.OpenKey(SubKey, CreateKey) then
+      raise Exception.Create('Unable to open HKCU:\' + SubKey);
+    Reg.WriteInteger(ValueName, Value);
+  finally
+    Reg.Free;
+  end;
+end;
+
+procedure SetOutlookObjectModelGuardMachine(const AOfficeVersion: string;
+  const AValue: Integer; out AWriteResults: TArray<TOutlookGuardWriteResult>);
+var
+  OfficeVersion: string;
+  NativeSubKey, ClickToRunNativeSubKey, ClickToRunWow64SubKey: string;
+  Targets: TArray<TOutlookGuardWriteTarget>;
+  I: Integer;
+begin
+  if AOfficeVersion = '' then
+    OfficeVersion := GetLatestOutlookOfficeVersion
+  else
+    OfficeVersion := AOfficeVersion;
+
+  if OfficeVersion = '' then
+    raise Exception.Create('Could not detect installed Outlook Office version. No registry key was written.');
+
+  NativeSubKey := Format('SOFTWARE\Microsoft\Office\%s\Outlook\Security', [OfficeVersion]);
+  ClickToRunNativeSubKey := Format('SOFTWARE\Microsoft\Office\ClickToRun\REGISTRY\MACHINE\Software\Microsoft\Office\%s\Outlook\Security', [OfficeVersion]);
+  ClickToRunWow64SubKey := Format('SOFTWARE\Microsoft\Office\ClickToRun\REGISTRY\MACHINE\Software\Wow6432Node\Microsoft\Office\%s\Outlook\Security', [OfficeVersion]);
+
+  SetLength(Targets, 0);
+  AddOutlookGuardWriteTarget(Targets, NativeSubKey, KEY_WOW64_64KEY, True);
+  AddOutlookGuardWriteTarget(Targets, NativeSubKey, KEY_WOW64_32KEY, True);
+
+  if HKLM_KeyExists(ClickToRunNativeSubKey, KEY_WOW64_64KEY) then
+    AddOutlookGuardWriteTarget(Targets, ClickToRunNativeSubKey, KEY_WOW64_64KEY, False);
+  if HKLM_KeyExists(ClickToRunNativeSubKey, KEY_WOW64_32KEY) then
+    AddOutlookGuardWriteTarget(Targets, ClickToRunNativeSubKey, KEY_WOW64_32KEY, False);
+  if HKLM_KeyExists(ClickToRunWow64SubKey, KEY_WOW64_64KEY) then
+    AddOutlookGuardWriteTarget(Targets, ClickToRunWow64SubKey, KEY_WOW64_64KEY, False);
+  if HKLM_KeyExists(ClickToRunWow64SubKey, KEY_WOW64_32KEY) then
+    AddOutlookGuardWriteTarget(Targets, ClickToRunWow64SubKey, KEY_WOW64_32KEY, False);
+
+  SetLength(AWriteResults, Length(Targets));
+  for I := 0 to High(Targets) do
+  begin
+    AWriteResults[I].RegistryPath := Targets[I].RegistryPath;
+    AWriteResults[I].Success := False;
+    AWriteResults[I].ErrorMessage := '';
+    try
+      WriteHKLM_DWORD(Targets[I].SubKey, 'ObjectModelGuard', AValue,
+        Targets[I].Access, Targets[I].CreateKey);
+      AWriteResults[I].Success := True;
+    except
+      on E: Exception do
+        AWriteResults[I].ErrorMessage := E.Message;
+    end;
+  end;
+end;
+
+procedure SetOutlookObjectModelGuardPolicyCurrentUser(const AOfficeVersion: string;
+  out AWriteResults: TArray<TOutlookGuardWriteResult>);
+var
+  OfficeVersion, PolicySubKey: string;
+  ValueNames: array[0..4] of string;
+  Values: array[0..4] of Integer;
+  I: Integer;
+begin
+  if AOfficeVersion = '' then
+    OfficeVersion := GetLatestOutlookOfficeVersion
+  else
+    OfficeVersion := AOfficeVersion;
+
+  if OfficeVersion = '' then
+    raise Exception.Create('Could not detect installed Outlook Office version. No current-user policy key was written.');
+
+  PolicySubKey := Format('Software\Policies\Microsoft\Office\%s\Outlook\Security', [OfficeVersion]);
+
+  ValueNames[0] := 'AdminSecurityMode';
+  Values[0] := 3;
+  ValueNames[1] := 'PromptOOMAddressInformationAccess';
+  Values[1] := 2;
+  ValueNames[2] := 'PromptOOMAddressBookAccess';
+  Values[2] := 2;
+  ValueNames[3] := 'PromptOOMSend';
+  Values[3] := 2;
+  ValueNames[4] := 'PromptOOMSaveAs';
+  Values[4] := 2;
+
+  SetLength(AWriteResults, Length(ValueNames));
+  for I := Low(ValueNames) to High(ValueNames) do
+  begin
+    AWriteResults[I].RegistryPath := 'HKCU:\' + PolicySubKey + '\' + ValueNames[I];
+    AWriteResults[I].Success := False;
+    AWriteResults[I].ErrorMessage := '';
+    try
+      WriteHKCU_DWORD(PolicySubKey, ValueNames[I], Values[I], True);
+      AWriteResults[I].Success := True;
+    except
+      on E: Exception do
+        AWriteResults[I].ErrorMessage := E.Message;
+    end;
+  end;
+end;
+
+function IsOutlookObjectModelGuardNeverWarn(const AGuardState: TOutlookGuardResult): Boolean;
+begin
+  Result := False;
+  case AGuardState.Mode of
+    emPolicyControlled:
+      Result :=
+        (AGuardState.AdminSecurityMode = 3) and
+        (AGuardState.PromptOOMSend = 2) and
+        (AGuardState.PromptOOMAddressInformationAccess = 2) and
+        (AGuardState.PromptOOMAddressBookAccess = 2) and
+        (AGuardState.PromptOOMSaveAs = 2);
+    emMachineObjectModelGuard:
+      Result := AGuardState.ObjectModelGuardValue = 2;
+  end;
+end;
+
 function ReadEffectiveOutlookObjectModelGuard(
   const AOfficeVersion: string): TOutlookGuardResult;
 var
@@ -1173,13 +1376,20 @@ end;
 function GetOutlookObjectModelGuardValue(const AOfficeVersion: string = ''): Integer;
 var
   OfficeVersion: String;
+  GuardState: TOutlookGuardResult;
 begin
 
   if AOfficeVersion='' then
     OfficeVersion:= GetLatestOutlookOfficeVersion
   else
     OfficeVersion:= AOfficeVersion;
-  Result:= ReadEffectiveOutlookObjectModelGuard(OfficeVersion).ObjectModelGuardValue;
+  GuardState := ReadEffectiveOutlookObjectModelGuard(OfficeVersion);
+  if GuardState.Mode = emMachineObjectModelGuard then
+    Result := GuardState.ObjectModelGuardValue
+  else if IsOutlookObjectModelGuardNeverWarn(GuardState) then
+    Result := 2
+  else
+    Result := -1;
 end;
 
 function GetLatestOutlookOfficeVersion: string;
@@ -1272,7 +1482,7 @@ function GetLatestOutlookOfficeVersion: string;
     Names: TStrings;
     i: Integer;
   begin
-    Names:= TStrings.Create;
+    Names:= TStringList.Create;
     try
       Reg := TRegistry.Create(KEY_READ or Access);
       try

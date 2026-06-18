@@ -1,4 +1,5 @@
 *.dcu
+.env
 /bin/
 /bin64/
 /Win32/
